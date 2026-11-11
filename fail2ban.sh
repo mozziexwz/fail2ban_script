@@ -354,22 +354,51 @@ wait_jail() {
   local i
   for i in $(seq 1 20); do
     fail2ban-client status "$JAIL" >/dev/null 2>&1 && return 0
+    systemctl is-failed --quiet fail2ban 2>/dev/null && return 1
     sleep 1
   done
   return 1
 }
 
 show_failure_logs() {
-  echo "----- journalctl -u fail2ban (最近 20 行) -----" >&2
-  journalctl -u fail2ban -n 20 --no-pager >&2 2>/dev/null || true
+  echo "----- journalctl -u fail2ban (最近 15 行) -----" >&2
+  journalctl -u fail2ban -n 15 --no-pager 2>/dev/null | cut -c1-300 >&2
   if [ -s "$F2B_LOG" ]; then
-    echo "----- $F2B_LOG (最近 15 行) -----" >&2
-    tail -n 15 "$F2B_LOG" >&2
+    echo "----- $F2B_LOG 中的错误 -----" >&2
+    tail -n 60 "$F2B_LOG" | grep -E ' (ERROR|CRITICAL) ' | tail -n 8 | cut -c1-200 |
+      sed -E 's/(.{200})$/\1 .../' >&2
   fi
 }
 
-# 写入 jail.local -> 校验 -> 重启；校验失败自动还原
+# reload 只对这些键可靠：ignoreip / bantime* / findtime / maxretry。
+# 端口、封禁动作、过滤模式、后端的改动要重启才会重建防火墙规则和过滤器（实测 reload 不更新 nft 规则里的端口）。
+needs_restart() {
+  local skip='^[[:space:]]*(#|ignoreip|bantime|findtime|maxretry)'
+  [ "$(grep -vE "$skip" "$1" 2>/dev/null)" != "$(grep -vE "$skip" "$2" 2>/dev/null)" ]
+}
+
+# 让当前 jail.local 生效：activate reload|restart
+activate() {
+  local how=$1
+  if [ "$how" = reload ] && fail2ban-client ping >/dev/null 2>&1; then
+    if ! fail2ban-client reload >/dev/null 2>&1; then
+      warn "重新加载失败，改为重启服务。"
+      how=restart
+    fi
+  else
+    how=restart
+  fi
+  if [ "$how" = restart ]; then
+    systemctl restart fail2ban || return 1
+  fi
+  wait_jail
+}
+
+# 写入 jail.local -> 校验 -> 生效；任何一步失败都还原为修改前的配置
+# apply_config          能 reload 就 reload（不会撤掉再恢复现有封禁），否则重启
+# apply_config restart  强制重启（部署时用，fail2ban.local 的改动需要重启才生效）
 apply_config() {
+  local how=${1:-reload}
   local tmp out ver had_prev=0
   tmp=$(mktemp) || { err "无法创建临时文件"; return 1; }
   render_config >"$tmp"
@@ -378,6 +407,9 @@ apply_config() {
   if [ -f "$JAIL_LOCAL" ]; then
     cp -p "$JAIL_LOCAL" "$JAIL_LOCAL.prev"
     had_prev=1
+    needs_restart "$JAIL_LOCAL.prev" "$tmp" && how=restart
+  else
+    how=restart
   fi
   cat "$tmp" >"$JAIL_LOCAL"
   chmod 644 "$JAIL_LOCAL"
@@ -387,10 +419,10 @@ apply_config() {
   if ver_ge "${ver:-0.0}" 0.10; then
     if ! out=$(fail2ban-client -t 2>&1); then
       err "配置校验失败（fail2ban-client -t）："
-      printf '%s\n' "$out" | sed 's/^/    /' >&2
+      printf '%s\n' "$out" | grep -E 'ERROR|CRITICAL' | cut -c1-300 | sed 's/^/    /' >&2
       if [ "$had_prev" = 1 ]; then
         cp -p "$JAIL_LOCAL.prev" "$JAIL_LOCAL"
-        warn "已还原为修改前的配置。"
+        warn "已还原为修改前的配置，运行中的服务未受影响。"
       else
         rm -f "$JAIL_LOCAL"
         warn "已删除刚写入的配置。"
@@ -400,14 +432,19 @@ apply_config() {
   fi
 
   systemctl enable fail2ban >/dev/null 2>&1 || warn "设置开机自启失败。"
-  if ! systemctl restart fail2ban; then
-    err "fail2ban 重启失败。"
+  # fail2ban-client -t 只查语法和文件是否存在，查不出非法取值，所以生效失败也要回滚
+  if ! activate "$how"; then
+    err "新配置没能生效（服务未启动或 $JAIL jail 没有起来）。"
     show_failure_logs
-    return 1
-  fi
-  if ! wait_jail; then
-    err "fail2ban 已启动，但 $JAIL jail 没有起来。"
-    show_failure_logs
+    if [ "$had_prev" = 1 ]; then
+      cp -p "$JAIL_LOCAL.prev" "$JAIL_LOCAL"
+      warn "已还原为修改前的配置，正在重启服务..."
+      if systemctl restart fail2ban 2>/dev/null && wait_jail; then
+        ok "服务已恢复到修改前的状态。"
+      else
+        err "还原后服务仍然没能启动（修改前的配置本身可能就有问题），请查看: journalctl -u fail2ban"
+      fi
+    fi
     return 1
   fi
   ok "配置已生效，$JAIL jail 运行中。"
@@ -423,6 +460,10 @@ show_ladder() {
     return
   fi
   m=$(to_seconds "$CFG_MAXTIME") || { printf '%s 起，上限 %s' "$CFG_BANTIME" "$CFG_MAXTIME"; return; }
+  if [ "$m" -lt "$b" ]; then
+    printf '首次 %s，但上限只有 %s —— 上限应不小于首次封禁时长' "$(fmt_duration "$b")" "$(fmt_duration "$m")"
+    return
+  fi
   for i in 0 1 2 3 4 5; do
     if [ "$i" -eq 0 ]; then
       t=$b
@@ -665,7 +706,7 @@ do_install() {
   fi
 
   write_f2b_local
-  apply_config || return 1
+  apply_config restart || return 1
 
   echo
   echo "${BOLD}部署完成，当前配置：${NC}"
@@ -691,6 +732,12 @@ svc_state() {
   esac
 }
 
+enabled_state() {
+  local s
+  s=$(systemctl is-enabled fail2ban 2>/dev/null)
+  printf '%s' "${s:-未知}"
+}
+
 banned_count() {
   fail2ban-client status "$JAIL" 2>/dev/null |
     awk -F: '/Currently banned/ { gsub(/[[:space:]]/, "", $2); print $2 }'
@@ -707,7 +754,7 @@ do_status() {
   echo "${BOLD}== fail2ban 状态 ==${NC}"
   printf '  版本:       %s\n' "$(f2b_version)"
   printf '  服务:       %s\n' "$(svc_state)"
-  printf '  开机自启:   %s\n' "$(systemctl is-enabled fail2ban 2>/dev/null || echo 未知)"
+  printf '  开机自启:   %s\n' "$(enabled_state)"
   if load_config; then
     print_config_summary
   else
@@ -855,6 +902,19 @@ menu_whitelist() {
 
 # ---------------------------------------------------------------- 修改参数
 
+# 启用递增时，封禁上限不能小于首次封禁时长
+params_consistent() {
+  local b m
+  [ "$CFG_INCREMENT" = true ] || return 0
+  [ "$CFG_BANTIME" = "-1" ] && return 0
+  b=$(to_seconds "$CFG_BANTIME") || return 0
+  m=$(to_seconds "$CFG_MAXTIME") || return 0
+  if [ "$m" -lt "$b" ]; then
+    err "bantime.maxtime（$CFG_MAXTIME）小于 bantime（$CFG_BANTIME），请先调整其中一个。"
+    return 1
+  fi
+}
+
 menu_params() {
   need_managed || return 1
   load_config
@@ -926,13 +986,17 @@ menu_params() {
         ;;
       s|S)
         [ "$dirty" = 1 ] || continue
+        if ! params_consistent; then continue; fi
         apply_config && dirty=0
         return 0
         ;;
       q|Q) info "已放弃修改。"; return 0 ;;
       0|"")
         if [ "$dirty" = 1 ]; then
-          if confirm "有未保存的修改，保存并应用？" y; then apply_config; fi
+          if confirm "有未保存的修改，保存并应用？" y; then
+            if ! params_consistent; then continue; fi
+            apply_config
+          fi
         fi
         return 0
         ;;
@@ -1041,7 +1105,7 @@ menu_service() {
   need_f2b || return 1
   while true; do
     echo
-    echo "${BOLD}== 服务管理 ==${NC}  当前: $(svc_state)  开机自启: $(systemctl is-enabled fail2ban 2>/dev/null || echo 未知)"
+    echo "${BOLD}== 服务管理 ==${NC}  当前: $(svc_state)  开机自启: $(enabled_state)"
     echo "  1) 启动    2) 停止    3) 重启"
     echo "  4) 开启开机自启    5) 关闭开机自启"
     echo "  0) 返回"

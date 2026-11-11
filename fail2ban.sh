@@ -14,7 +14,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 F2B_DIR="${F2B_DIR:-/etc/fail2ban}"
 JAIL_LOCAL="$F2B_DIR/jail.local"
 F2B_LOCAL="$F2B_DIR/fail2ban.local"
@@ -172,14 +172,50 @@ ver_ge() {
 
 is_ipv4() {
   local ip=$1 o
-  [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  # 不接受前导零（010.0.0.1 在有些工具里会被当成八进制）
+  local oct='(0|[1-9][0-9]{0,2})'
+  [[ $ip =~ ^$oct\.$oct\.$oct\.$oct$ ]] || return 1
   for o in "${BASH_REMATCH[@]:1}"; do
-    (( 10#$o <= 255 )) || return 1
+    (( o <= 255 )) || return 1
   done
 }
 
+# 统计一段不含 "::" 的 IPv6 片段有几组，格式不对返回 1；空串算 0 组
+_v6_groups() {
+  local seg=$1 g n=0
+  if [ -z "$seg" ]; then echo 0; return 0; fi
+  [[ $seg == :* || $seg == *: || $seg == *::* ]] && return 1
+  local IFS=:
+  for g in $seg; do
+    [[ $g =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    n=$((n + 1))
+  done
+  echo "$n"
+}
+
 is_ipv6() {
-  [[ $1 == *:* ]] && [[ $1 =~ ^[0-9A-Fa-f:.]+$ ]]
+  local ip=$1 v4 h t nh nt
+  [[ $ip == *:* && $ip =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+  if [[ $ip == *.* ]]; then
+    # 末尾内嵌 IPv4（如 ::ffff:1.2.3.4），占两组
+    v4=${ip##*:}
+    is_ipv4 "$v4" || return 1
+    ip="${ip%"$v4"}0:0"
+  fi
+  if [[ $ip == *::* ]]; then
+    h=${ip%%::*}
+    t=${ip#*::}
+    nh=$(_v6_groups "$h") || return 1
+    nt=$(_v6_groups "$t") || return 1
+    (( nh + nt <= 7 ))
+  else
+    nh=$(_v6_groups "$ip") || return 1
+    (( nh == 8 ))
+  fi
+}
+
+is_loopback_entry() {
+  [[ $1 == 127.* || $1 == ::1 || $1 == ::1/128 ]]
 }
 
 # 接受 IPv4 / IPv6，可带 /掩码
@@ -188,7 +224,7 @@ is_ip_or_cidr() {
   ip=${v%%/*}
   if [[ $v == */* ]]; then
     mask=${v#*/}
-    [[ $mask =~ ^[0-9]{1,3}$ ]] || return 1
+    [[ $mask =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
     if is_ipv4 "$ip"; then (( mask <= 32 )) || return 1
     elif is_ipv6 "$ip"; then (( mask <= 128 )) || return 1
     else return 1
@@ -202,10 +238,11 @@ valid_time() { [[ $1 =~ ^[0-9]+(s|m|h|d|w|mo|y)?$ ]]; }
 
 valid_ports() {
   local p
-  [[ $1 =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  # 不接受前导零：022 写进防火墙规则可能被当成八进制
+  [[ $1 =~ ^[1-9][0-9]{0,4}(,[1-9][0-9]{0,4})*$ ]] || return 1
   local IFS=,
   for p in $1; do
-    (( 10#$p >= 1 && 10#$p <= 65535 )) || return 1
+    (( p <= 65535 )) || return 1
   done
 }
 
@@ -282,6 +319,7 @@ load_config() {
   reset_defaults
   is_managed || return 1
   CFG_INCREMENT="false"
+  CFG_IGNOREIP=""        # 白名单被清空时文件里是空值，不能回落到默认值
   _ld CFG_IGNOREIP      DEFAULT ignoreip
   _ld CFG_BANACTION     DEFAULT banaction
   _ld CFG_BANACTION_ALL DEFAULT banaction_allports
@@ -858,10 +896,14 @@ menu_whitelist() {
     echo
     echo "${BOLD}== 白名单（ignoreip）==${NC}"
     i=1
-    for n in "${items[@]}"; do
-      printf '  %2d) %s\n' "$i" "$n"
-      i=$((i + 1))
-    done
+    if [ "${#items[@]}" -gt 0 ]; then
+      for n in "${items[@]}"; do
+        printf '  %2d) %s\n' "$i" "$n"
+        i=$((i + 1))
+      done
+    else
+      echo "  （空）"
+    fi
     echo
     echo "  a) 添加 IP / 网段"
     echo "  d) 删除"
@@ -889,6 +931,11 @@ menu_whitelist() {
         if ! [[ $REPLY =~ ^[0-9]+$ ]] || [ "$REPLY" -lt 1 ] || [ "$REPLY" -gt "${#items[@]}" ]; then
           err "序号无效。"
           continue
+        fi
+        target=${items[$((REPLY - 1))]}
+        if is_loopback_entry "$target"; then
+          warn "$target 是本机回环地址，一般应保留在白名单里。"
+          confirm "确定删除？" n || continue
         fi
         unset "items[$((REPLY - 1))]"
         CFG_IGNOREIP="${items[*]:-}"

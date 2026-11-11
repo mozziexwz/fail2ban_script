@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n fail2ban.sh && bash -n tests/run.sh
+
+      - name: ShellCheck
+        run: shellcheck --severity=warning fail2ban.sh tests/run.sh
+
+      - name: Function tests
+        run: bash tests/run.sh

@@ -93,3 +93,13 @@ port = 22
 - 手动解封会同时清掉该 IP 的封禁历史，它下次再犯会从首次封禁时长重新算；只有封禁自然到期的 IP 才会递增。
 - 脚本只安装 `nft` 命令，不会启用 `nftables.service`（那个服务会加载带 `flush ruleset` 的 `/etc/nftables.conf`，可能冲掉 ufw / docker 的规则）。
 - 生成的配置文件请通过脚本菜单修改，手动改动会在下次脚本写配置时被覆盖。
+
+## 开发
+
+函数级测试不需要 root，也不需要安装 fail2ban：
+
+```bash
+bash tests/run.sh
+```
+
+每次推送会由 GitHub Actions 自动跑语法检查、ShellCheck 和这组测试（`.github/workflows/ci.yml`）。安装、防火墙规则、服务启停这些只能在真机上验证，测试不覆盖。

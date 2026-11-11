@@ -1,0 +1,1200 @@
+#!/usr/bin/env bash
+#
+# fail2ban 一键部署 / 管理脚本（保护 SSH）
+# https://github.com/mozziexwz/fail2ban_script
+#
+# 用法:
+#   bash fail2ban.sh                 交互菜单
+#   bash fail2ban.sh install [-y]    一键部署（-y 全部使用默认值，不提问）
+#   bash fail2ban.sh status          查看状态
+#   bash fail2ban.sh unban <IP>|--all
+#   bash fail2ban.sh ban <IP>
+#   bash fail2ban.sh ports           仅显示检测到的 SSH 端口
+#   bash fail2ban.sh uninstall [-y]
+
+set -u
+
+SCRIPT_VERSION="1.0.0"
+F2B_DIR="${F2B_DIR:-/etc/fail2ban}"
+JAIL_LOCAL="$F2B_DIR/jail.local"
+F2B_LOCAL="$F2B_DIR/fail2ban.local"
+F2B_LOG="${F2B_LOG:-/var/log/fail2ban.log}"
+# 生成的配置文件只写 ASCII，避免 fail2ban 在 C locale 下读配置出编码问题
+MARKER="# Managed by fail2ban.sh (fail2ban_script)"
+JAIL="sshd"
+ASSUME_YES=0
+INPUT=""
+PKG=""
+OS_ID=""
+OS_VER=""
+
+# ---------------------------------------------------------------- 输出 / 输入
+
+RED=""; GREEN=""; YELLOW=""; CYAN=""; BOLD=""; NC=""
+if [ -t 1 ]; then
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+  CYAN=$'\033[36m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+fi
+
+info() { printf '%s\n' "${CYAN}[信息]${NC} $*"; }
+ok()   { printf '%s\n' "${GREEN}[完成]${NC} $*"; }
+warn() { printf '%s\n' "${YELLOW}[注意]${NC} $*" >&2; }
+err()  { printf '%s\n' "${RED}[错误]${NC} $*" >&2; }
+
+init_input() {
+  if [ -t 0 ]; then
+    INPUT=/dev/stdin
+  elif { : </dev/tty; } 2>/dev/null; then
+    INPUT=/dev/tty        # 例如 curl ... | bash
+  else
+    INPUT=""
+  fi
+}
+
+trim() {
+  local s=$1
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# ask "提示" [默认值]  -> 结果放在 REPLY；读到 EOF 返回 1
+ask() {
+  local prompt=$1 def=${2:-}
+  if [ "$ASSUME_YES" = 1 ] || [ -z "$INPUT" ]; then
+    REPLY=$def
+    return 0
+  fi
+  if [ -n "$def" ]; then
+    printf '%s [%s]: ' "$prompt" "$def"
+  else
+    printf '%s: ' "$prompt"
+  fi
+  if ! IFS= read -r REPLY <"$INPUT"; then
+    REPLY=$def
+    echo
+    return 1
+  fi
+  REPLY=$(trim "$REPLY")
+  [ -z "$REPLY" ] && REPLY=$def
+  return 0
+}
+
+# confirm "问题" [y|n]  -> 默认值在 -y 模式下直接生效
+confirm() {
+  local def=${2:-n} hint="y/N"
+  [ "$def" = y ] && hint="Y/n"
+  if [ "$ASSUME_YES" = 1 ] || [ -z "$INPUT" ]; then
+    [ "$def" = y ]
+    return
+  fi
+  printf '%s (%s): ' "$1" "$hint"
+  local a=""
+  IFS= read -r a <"$INPUT" || { echo; a=""; }
+  a=$(trim "$a")
+  [ -z "$a" ] && a=$def
+  case "$a" in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+}
+
+pause() {
+  [ "$ASSUME_YES" = 1 ] || [ -z "$INPUT" ] && return 0
+  printf '\n按回车返回菜单...'
+  local _x
+  IFS= read -r _x <"$INPUT" || true
+}
+
+# ---------------------------------------------------------------- 基础检查
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    err "需要 root 权限，请用 root 运行，或: sudo bash $0"
+    exit 1
+  fi
+}
+
+require_systemd() {
+  if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+    err "本脚本只支持使用 systemd 的系统。"
+    return 1
+  fi
+}
+
+need_f2b() {
+  if ! command -v fail2ban-client >/dev/null 2>&1; then
+    err "尚未安装 fail2ban，请先执行菜单 1（一键部署）。"
+    return 1
+  fi
+}
+
+need_running() {
+  need_f2b || return 1
+  if ! fail2ban-client ping >/dev/null 2>&1; then
+    err "fail2ban 服务未运行，请先在「服务管理」里启动。"
+    return 1
+  fi
+}
+
+is_managed() { [ -f "$JAIL_LOCAL" ] && grep -qF "$MARKER" "$JAIL_LOCAL"; }
+
+need_managed() {
+  if ! is_managed; then
+    err "没有找到本脚本生成的 $JAIL_LOCAL，请先执行菜单 1（一键部署）。"
+    return 1
+  fi
+}
+
+detect_os() {
+  if [ -r /etc/os-release ]; then
+    OS_ID=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")
+    OS_VER=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}")
+  fi
+  if command -v apt-get >/dev/null 2>&1; then PKG=apt
+  elif command -v dnf >/dev/null 2>&1; then PKG=dnf
+  elif command -v yum >/dev/null 2>&1; then PKG=yum
+  else PKG=""
+  fi
+}
+
+f2b_version() {
+  fail2ban-client --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1
+}
+
+# ver_ge 1.0.2 0.11  -> 只比较 主.次 版本
+ver_ge() {
+  local a1 a2 b1 b2 _r
+  IFS=. read -r a1 a2 _r <<<"$1"
+  IFS=. read -r b1 b2 _r <<<"$2"
+  a1=${a1:-0}; a2=${a2:-0}; b1=${b1:-0}; b2=${b2:-0}
+  (( a1 > b1 || (a1 == b1 && a2 >= b2) ))
+}
+
+# ---------------------------------------------------------------- 校验
+
+is_ipv4() {
+  local ip=$1 o
+  [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do
+    (( 10#$o <= 255 )) || return 1
+  done
+}
+
+is_ipv6() {
+  [[ $1 == *:* ]] && [[ $1 =~ ^[0-9A-Fa-f:.]+$ ]]
+}
+
+# 接受 IPv4 / IPv6，可带 /掩码
+is_ip_or_cidr() {
+  local v=$1 ip mask
+  ip=${v%%/*}
+  if [[ $v == */* ]]; then
+    mask=${v#*/}
+    [[ $mask =~ ^[0-9]{1,3}$ ]] || return 1
+    if is_ipv4 "$ip"; then (( mask <= 32 )) || return 1
+    elif is_ipv6 "$ip"; then (( mask <= 128 )) || return 1
+    else return 1
+    fi
+    return 0
+  fi
+  is_ipv4 "$ip" || is_ipv6 "$ip"
+}
+
+valid_time() { [[ $1 =~ ^[0-9]+(s|m|h|d|w|mo|y)?$ ]]; }
+
+valid_ports() {
+  local p
+  [[ $1 =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  local IFS=,
+  for p in $1; do
+    (( 10#$p >= 1 && 10#$p <= 65535 )) || return 1
+  done
+}
+
+to_seconds() {
+  local n u
+  [[ $1 =~ ^([0-9]+)(s|m|h|d|w|mo|y)?$ ]] || return 1
+  n=${BASH_REMATCH[1]}
+  u=${BASH_REMATCH[2]:-s}
+  case "$u" in
+    m)  n=$((n * 60)) ;;
+    h)  n=$((n * 3600)) ;;
+    d)  n=$((n * 86400)) ;;
+    w)  n=$((n * 604800)) ;;
+    mo) n=$((n * 2592000)) ;;
+    y)  n=$((n * 31536000)) ;;
+  esac
+  printf '%s' "$n"
+}
+
+fmt_duration() {
+  local s=$1 out="" d h m
+  d=$((s / 86400)); h=$(((s % 86400) / 3600)); m=$(((s % 3600) / 60))
+  (( d > 0 )) && out+="${d}天"
+  (( h > 0 )) && out+="${h}小时"
+  (( m > 0 )) && out+="${m}分钟"
+  [ -z "$out" ] && out="${s}秒"
+  printf '%s' "$out"
+}
+
+# ---------------------------------------------------------------- 配置读写
+
+reset_defaults() {
+  CFG_IGNOREIP="127.0.0.1/8 ::1"
+  CFG_BANACTION="nftables-multiport"
+  CFG_BANACTION_ALL="nftables-allports"
+  CFG_BANTIME="1d"
+  CFG_FINDTIME="15m"
+  CFG_MAXRETRY="5"
+  CFG_INCREMENT="true"
+  CFG_FACTOR="1"
+  CFG_MAXTIME="1w"
+  CFG_MODE="normal"
+  CFG_BACKEND="systemd"
+  CFG_PORT="22"
+}
+
+# ini_get 文件 段名 键名
+ini_get() {
+  awk -v sec="$2" -v key="$3" '
+    /^[[:space:]]*\[/ {
+      cur = $0
+      sub(/^[[:space:]]*\[/, "", cur); sub(/\].*$/, "", cur)
+      next
+    }
+    /^[[:space:]]*[#;]/ { next }
+    cur == sec {
+      i = index($0, "=")
+      if (!i) next
+      k = substr($0, 1, i - 1); v = substr($0, i + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      if (k == key) { print v; exit }
+    }' "$1" 2>/dev/null
+}
+
+_ld() {
+  local v
+  v=$(ini_get "$JAIL_LOCAL" "$2" "$3")
+  [ -n "$v" ] && printf -v "$1" '%s' "$v"
+  return 0
+}
+
+load_config() {
+  reset_defaults
+  is_managed || return 1
+  CFG_INCREMENT="false"
+  _ld CFG_IGNOREIP      DEFAULT ignoreip
+  _ld CFG_BANACTION     DEFAULT banaction
+  _ld CFG_BANACTION_ALL DEFAULT banaction_allports
+  _ld CFG_BANTIME       DEFAULT bantime
+  _ld CFG_FINDTIME      DEFAULT findtime
+  _ld CFG_MAXRETRY      DEFAULT maxretry
+  _ld CFG_INCREMENT     DEFAULT bantime.increment
+  _ld CFG_FACTOR        DEFAULT bantime.factor
+  _ld CFG_MAXTIME       DEFAULT bantime.maxtime
+  _ld CFG_MODE          "$JAIL" mode
+  _ld CFG_BACKEND       "$JAIL" backend
+  _ld CFG_PORT          "$JAIL" port
+  CFG_IGNOREIP=$(trim "${CFG_IGNOREIP//,/ }")
+  return 0
+}
+
+render_config() {
+  cat <<EOF
+$MARKER
+# Generated: $(date '+%F %T')
+# Change settings through the script menu; manual edits are overwritten
+# the next time the script rewrites this file.
+
+[DEFAULT]
+ignoreip = $CFG_IGNOREIP
+banaction = $CFG_BANACTION
+banaction_allports = $CFG_BANACTION_ALL
+
+bantime = $CFG_BANTIME
+findtime = $CFG_FINDTIME
+maxretry = $CFG_MAXRETRY
+EOF
+  if [ "$CFG_INCREMENT" = true ]; then
+    cat <<EOF
+bantime.increment = true
+bantime.factor = $CFG_FACTOR
+bantime.maxtime = $CFG_MAXTIME
+EOF
+  fi
+  cat <<EOF
+
+[$JAIL]
+enabled = true
+mode = $CFG_MODE
+backend = $CFG_BACKEND
+port = $CFG_PORT
+EOF
+}
+
+# 封禁历史默认只保留 1 天左右，递增封禁需要更长的记忆。
+# fail2ban 读取的是 [Definition] 段，写在这里对新旧版本都生效。
+write_f2b_local() {
+  if [ -f "$F2B_LOCAL" ] && ! grep -qF "$MARKER" "$F2B_LOCAL"; then
+    if ! grep -qE '^[[:space:]]*dbpurgeage' "$F2B_LOCAL"; then
+      warn "已存在非本脚本生成的 $F2B_LOCAL，未修改。"
+      warn "建议手动在 [Definition] 段加入: dbpurgeage = 2592000"
+    fi
+    return 0
+  fi
+  cat >"$F2B_LOCAL" <<EOF
+$MARKER
+# Keep ban history for 30 days so bantime.increment recognises repeat offenders.
+[Definition]
+dbpurgeage = 2592000
+EOF
+  chmod 644 "$F2B_LOCAL"
+}
+
+wait_jail() {
+  local i
+  for i in $(seq 1 20); do
+    fail2ban-client status "$JAIL" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+show_failure_logs() {
+  echo "----- journalctl -u fail2ban (最近 20 行) -----" >&2
+  journalctl -u fail2ban -n 20 --no-pager >&2 2>/dev/null || true
+  if [ -s "$F2B_LOG" ]; then
+    echo "----- $F2B_LOG (最近 15 行) -----" >&2
+    tail -n 15 "$F2B_LOG" >&2
+  fi
+}
+
+# 写入 jail.local -> 校验 -> 重启；校验失败自动还原
+apply_config() {
+  local tmp out ver had_prev=0
+  tmp=$(mktemp) || { err "无法创建临时文件"; return 1; }
+  render_config >"$tmp"
+
+  mkdir -p "$F2B_DIR"
+  if [ -f "$JAIL_LOCAL" ]; then
+    cp -p "$JAIL_LOCAL" "$JAIL_LOCAL.prev"
+    had_prev=1
+  fi
+  cat "$tmp" >"$JAIL_LOCAL"
+  chmod 644 "$JAIL_LOCAL"
+  rm -f "$tmp"
+
+  ver=$(f2b_version)
+  if ver_ge "${ver:-0.0}" 0.10; then
+    if ! out=$(fail2ban-client -t 2>&1); then
+      err "配置校验失败（fail2ban-client -t）："
+      printf '%s\n' "$out" | sed 's/^/    /' >&2
+      if [ "$had_prev" = 1 ]; then
+        cp -p "$JAIL_LOCAL.prev" "$JAIL_LOCAL"
+        warn "已还原为修改前的配置。"
+      else
+        rm -f "$JAIL_LOCAL"
+        warn "已删除刚写入的配置。"
+      fi
+      return 1
+    fi
+  fi
+
+  systemctl enable fail2ban >/dev/null 2>&1 || warn "设置开机自启失败。"
+  if ! systemctl restart fail2ban; then
+    err "fail2ban 重启失败。"
+    show_failure_logs
+    return 1
+  fi
+  if ! wait_jail; then
+    err "fail2ban 已启动，但 $JAIL jail 没有起来。"
+    show_failure_logs
+    return 1
+  fi
+  ok "配置已生效，$JAIL jail 运行中。"
+}
+
+# 封禁阶梯预览：首次 = bantime；第 n 次(n>=2) = bantime * 2^(n-1) * factor，上限 maxtime
+show_ladder() {
+  local b m i t out=""
+  if [ "$CFG_BANTIME" = "-1" ]; then printf '永久封禁'; return; fi
+  b=$(to_seconds "$CFG_BANTIME") || { printf '%s' "$CFG_BANTIME"; return; }
+  if [ "$CFG_INCREMENT" != true ]; then
+    printf '每次 %s（未启用递增）' "$(fmt_duration "$b")"
+    return
+  fi
+  m=$(to_seconds "$CFG_MAXTIME") || { printf '%s 起，上限 %s' "$CFG_BANTIME" "$CFG_MAXTIME"; return; }
+  for i in 0 1 2 3 4 5; do
+    if [ "$i" -eq 0 ]; then
+      t=$b
+    else
+      t=$(awk -v b="$b" -v i="$i" -v f="$CFG_FACTOR" -v m="$m" \
+        'BEGIN { t = b * (2 ^ i) * f; if (t > m) t = m; printf "%d", t }')
+    fi
+    out+="${out:+ → }$(fmt_duration "$t")"
+    if [ "$i" -gt 0 ] && [ "$t" -ge "$m" ]; then
+      out+="（封顶）"
+      break
+    fi
+  done
+  printf '%s' "$out"
+}
+
+print_config_summary() {
+  printf '  SSH 端口:   %s\n' "$CFG_PORT"
+  printf '  触发条件:   %s 内失败 %s 次\n' "$CFG_FINDTIME" "$CFG_MAXRETRY"
+  printf '  封禁阶梯:   %s\n' "$(show_ladder)"
+  printf '  过滤模式:   %s\n' "$CFG_MODE"
+  printf '  日志后端:   %s\n' "$CFG_BACKEND"
+  printf '  封禁动作:   %s\n' "$CFG_BANACTION"
+  printf '  白名单:     %s\n' "$CFG_IGNOREIP"
+}
+
+# ---------------------------------------------------------------- SSH 端口 / 登录 IP
+
+parse_ss_sshd_ports() {
+  awk '$1 == "LISTEN" && /"sshd"/ { n = split($4, a, ":"); if (a[n] ~ /^[0-9]+$/) print a[n] }'
+}
+
+parse_socket_ports() {
+  grep -oE ':[0-9]+ \(Stream\)' | grep -oE '[0-9]+'
+}
+
+parse_sshd_T_ports() {
+  awk 'tolower($1) == "port" && $2 ~ /^[0-9]+$/ { print $2 }'
+}
+
+join_ports() {
+  grep -E '^[0-9]+$' | sort -n -u | paste -sd, -
+}
+
+# 取并集：实际监听的 sshd + socket 激活的 ssh.socket + sshd -T 的生效配置
+detect_ssh_ports() {
+  local ports="" unit sshd_bin
+  if command -v ss >/dev/null 2>&1; then
+    ports+=$'\n'$(ss -tlnp 2>/dev/null | parse_ss_sshd_ports)
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    for unit in ssh.socket sshd.socket; do
+      if systemctl is-active --quiet "$unit" 2>/dev/null; then
+        ports+=$'\n'$(systemctl show "$unit" -p Listen 2>/dev/null | parse_socket_ports)
+      fi
+    done
+  fi
+  sshd_bin=$(command -v sshd 2>/dev/null || true)
+  [ -z "$sshd_bin" ] && [ -x /usr/sbin/sshd ] && sshd_bin=/usr/sbin/sshd
+  if [ -n "$sshd_bin" ]; then
+    ports+=$'\n'$("$sshd_bin" -T 2>/dev/null | parse_sshd_T_ports)
+  fi
+  printf '%s\n' "$ports" | join_ports
+}
+
+detect_client_ip() {
+  local ip=""
+  if [ -n "${SSH_CONNECTION:-}" ]; then
+    ip=${SSH_CONNECTION%% *}
+  elif [ -n "${SSH_CLIENT:-}" ]; then
+    ip=${SSH_CLIENT%% *}
+  else
+    ip=$(who -m 2>/dev/null | sed -n 's/.*(\([^)]*\)).*/\1/p' | head -n1)
+  fi
+  ip=${ip%%%*}            # 去掉 IPv6 的 %zone
+  ip=${ip#::ffff:}        # IPv4-mapped IPv6
+  if is_ipv4 "$ip" || is_ipv6 "$ip"; then
+    printf '%s' "$ip"
+  fi
+}
+
+in_ignoreip() {
+  local x
+  for x in ${CFG_IGNOREIP//,/ }; do
+    [ "$x" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- 安装
+
+pkg_installed() {
+  case "$PKG" in
+    apt) dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed' ;;
+    dnf|yum) rpm -q "$1" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_epel() {
+  [ "$OS_ID" = fedora ] && return 0
+  rpm -q epel-release >/dev/null 2>&1 && return 0
+  info "启用 EPEL 仓库（fail2ban 在 EPEL 里）..."
+  "$PKG" install -y epel-release && return 0
+  if [ "$OS_ID" = ol ]; then
+    "$PKG" install -y "oracle-epel-release-el${OS_VER%%.*}" && return 0
+  fi
+  warn "自动启用 EPEL 失败，如果下面安装 fail2ban 失败，请先手动启用 EPEL。"
+  return 1
+}
+
+install_pkgs() {
+  local want=() missing=() p
+  case "$PKG" in
+    apt)     want=(fail2ban python3-systemd nftables) ;;
+    dnf|yum) want=(fail2ban fail2ban-systemd nftables) ;;
+    *) err "不支持的系统：找不到 apt-get / dnf / yum。"; return 1 ;;
+  esac
+  for p in "${want[@]}"; do
+    pkg_installed "$p" || missing+=("$p")
+  done
+  if [ "${#missing[@]}" -eq 0 ]; then
+    ok "依赖已安装: ${want[*]}"
+    return 0
+  fi
+  info "安装: ${missing[*]}"
+  case "$PKG" in
+    apt)
+      apt-get update -qq || warn "apt-get update 有报错，继续尝试安装。"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+      ;;
+    dnf|yum)
+      pkg_installed fail2ban || ensure_epel || true
+      "$PKG" install -y "${missing[@]}"
+      ;;
+  esac
+  if ! command -v fail2ban-client >/dev/null 2>&1; then
+    err "fail2ban 安装失败，请查看上面的包管理器输出。"
+    return 1
+  fi
+  # 注意：这里故意不启用 nftables.service，只需要 nft 命令本身。
+  # 启用该服务会加载 /etc/nftables.conf（通常带 flush ruleset），可能冲掉 ufw / docker 的规则。
+}
+
+choose_banaction() {
+  if command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1; then
+    if [ -f "$F2B_DIR/action.d/nftables-multiport.conf" ]; then
+      CFG_BANACTION="nftables-multiport"
+      CFG_BANACTION_ALL="nftables-allports"
+      return 0
+    elif [ -f "$F2B_DIR/action.d/nftables.conf" ]; then
+      CFG_BANACTION="nftables[type=multiport]"
+      CFG_BANACTION_ALL="nftables[type=allports]"
+      return 0
+    fi
+  fi
+  warn "nftables 在本机不可用（缺少 nft 或内核不支持），改用 iptables 动作。"
+  CFG_BANACTION="iptables-multiport"
+  CFG_BANACTION_ALL="iptables-allports"
+  command -v iptables >/dev/null 2>&1 || warn "也没有找到 iptables，封禁可能无法生效，请检查防火墙组件。"
+}
+
+# fail2ban 实际使用的 python 解释器（取 fail2ban-server 的 shebang）
+f2b_python() {
+  local s py=""
+  s=$(command -v fail2ban-server 2>/dev/null) && py=$(sed -n '1s/^#! *//p' "$s" 2>/dev/null)
+  printf '%s' "${py:-python3}"
+}
+
+choose_backend() {
+  local py
+  py=$(f2b_python)
+  # shellcheck disable=SC2086
+  if [ -d /run/systemd/system ] && $py -c 'import systemd.journal' >/dev/null 2>&1; then
+    CFG_BACKEND="systemd"
+  else
+    warn "python 的 systemd 模块不可用，backend 改用 auto（读取日志文件）。"
+    CFG_BACKEND="auto"
+  fi
+}
+
+do_install() {
+  require_root
+  require_systemd || return 1
+  detect_os
+  echo "${BOLD}== 一键部署 fail2ban ==${NC}"
+
+  install_pkgs || return 1
+
+  local ver detected myip bak keep=0
+  ver=$(f2b_version)
+  info "fail2ban 版本: ${ver:-未知}"
+
+  # 已有配置的处理
+  reset_defaults
+  if is_managed; then
+    if confirm "检测到本脚本之前生成的配置，保留现有参数和白名单？（选 n 恢复默认值）" y; then
+      load_config
+      keep=1
+    fi
+  elif [ -f "$JAIL_LOCAL" ]; then
+    bak="$JAIL_LOCAL.bak.$(date +%Y%m%d-%H%M%S)"
+    warn "已存在 $JAIL_LOCAL（不是本脚本生成的），将备份后覆盖。"
+    confirm "继续？" y || { info "已取消。"; return 1; }
+    cp -p "$JAIL_LOCAL" "$bak" && ok "已备份到 $bak"
+  fi
+
+  choose_banaction
+  choose_backend
+
+  if ver_ge "${ver:-0.0}" 0.11; then
+    [ "$keep" = 1 ] || CFG_INCREMENT="true"
+  else
+    warn "fail2ban ${ver:-?} 低于 0.11，不支持递增封禁（bantime.increment），已关闭该项。"
+    CFG_INCREMENT="false"
+  fi
+
+  # SSH 端口
+  detected=$(detect_ssh_ports)
+  if [ -n "$detected" ]; then
+    ok "检测到 SSH 端口: $detected"
+  else
+    warn "没能检测到 SSH 端口，默认使用 22，请确认。"
+    detected="22"
+  fi
+  while true; do
+    ask "要保护的 SSH 端口（多个用逗号分隔，回车确认）" "$detected" || true
+    if valid_ports "$REPLY"; then CFG_PORT=$REPLY; break; fi
+    err "端口格式不对，例如: 22 或 22,2222"
+    [ "$ASSUME_YES" = 1 ] || [ -z "$INPUT" ] && { CFG_PORT=$detected; break; }
+  done
+
+  # 当前登录 IP
+  myip=$(detect_client_ip)
+  if [ -n "$myip" ] && ! in_ignoreip "$myip"; then
+    info "你当前的登录 IP 是 $myip"
+    if confirm "把它加入白名单（永不封禁）？固定 IP 建议加，动态 IP 不建议" n; then
+      CFG_IGNOREIP="$CFG_IGNOREIP $myip"
+    fi
+  fi
+
+  write_f2b_local
+  apply_config || return 1
+
+  echo
+  echo "${BOLD}部署完成，当前配置：${NC}"
+  print_config_summary
+  echo
+  fail2ban-client status "$JAIL" 2>/dev/null | sed 's/^/  /'
+  if [ -n "$myip" ] && ! in_ignoreip "$myip"; then
+    echo
+    warn "你的 IP $myip 不在白名单里：${CFG_FINDTIME} 内输错 ${CFG_MAXRETRY} 次密码同样会被封。"
+  fi
+}
+
+# ---------------------------------------------------------------- 状态 / 封禁管理
+
+svc_state() {
+  local s
+  s=$(systemctl is-active fail2ban 2>/dev/null)
+  case "$s" in
+    active)   printf '%s' "${GREEN}运行中${NC}" ;;
+    failed)   printf '%s' "${RED}启动失败${NC}" ;;
+    inactive) printf '%s' "${YELLOW}已停止${NC}" ;;
+    *)        printf '%s' "${YELLOW}${s:-未知}${NC}" ;;
+  esac
+}
+
+banned_count() {
+  fail2ban-client status "$JAIL" 2>/dev/null |
+    awk -F: '/Currently banned/ { gsub(/[[:space:]]/, "", $2); print $2 }'
+}
+
+banned_list() {
+  fail2ban-client status "$JAIL" 2>/dev/null |
+    sed -n 's/.*Banned IP list:[[:space:]]*//p' | tr -s ' \t' '\n' | grep -v '^$'
+}
+
+do_status() {
+  need_f2b || return 1
+  local out
+  echo "${BOLD}== fail2ban 状态 ==${NC}"
+  printf '  版本:       %s\n' "$(f2b_version)"
+  printf '  服务:       %s\n' "$(svc_state)"
+  printf '  开机自启:   %s\n' "$(systemctl is-enabled fail2ban 2>/dev/null || echo 未知)"
+  if load_config; then
+    print_config_summary
+  else
+    warn "当前 jail.local 不是本脚本生成的，下面只显示运行状态。"
+  fi
+  echo
+  if ! fail2ban-client ping >/dev/null 2>&1; then
+    warn "fail2ban 服务未运行。"
+    return 1
+  fi
+  if ! fail2ban-client status "$JAIL"; then
+    warn "$JAIL jail 未启用。"
+    return 1
+  fi
+  echo
+  echo "当前封禁（IP / 封禁时间 + 时长 = 到期时间）："
+  if out=$(fail2ban-client get "$JAIL" banip --with-time 2>/dev/null) && [ -n "$out" ]; then
+    printf '%s\n' "$out" | sed 's/^/  /'
+  elif [ "$(banned_count)" = "0" ]; then
+    echo "  （无）"
+  else
+    banned_list | sed 's/^/  /'
+  fi
+}
+
+do_unban() {
+  need_running || return 1
+  local target=${1:-}
+  if [ "$target" = "--all" ]; then
+    fail2ban-client unban --all >/dev/null && ok "已解封全部 IP。"
+    return
+  fi
+  if ! is_ip_or_cidr "$target"; then
+    err "不是合法的 IP: $target"
+    return 1
+  fi
+  if fail2ban-client unban "$target" >/dev/null 2>&1 ||
+     fail2ban-client set "$JAIL" unbanip "$target" >/dev/null 2>&1; then
+    ok "已解封 $target"
+  else
+    err "解封失败: $target"
+    return 1
+  fi
+}
+
+do_ban() {
+  need_running || return 1
+  local target=${1:-} myip
+  if ! is_ip_or_cidr "$target"; then
+    err "不是合法的 IP: $target"
+    return 1
+  fi
+  myip=$(detect_client_ip)
+  if [ -n "$myip" ] && [ "$target" = "$myip" ]; then
+    warn "$target 是你当前的登录 IP，封禁后你会立刻断开！"
+    confirm "确定要封禁自己？" n || return 1
+  fi
+  if fail2ban-client set "$JAIL" banip "$target" >/dev/null; then
+    ok "已封禁 $target"
+  else
+    err "封禁失败: $target"
+    return 1
+  fi
+}
+
+menu_unban() {
+  need_running || return 1
+  local list
+  list=$(banned_list)
+  if [ -z "$list" ]; then
+    info "当前没有被封禁的 IP。"
+    return 0
+  fi
+  echo "当前封禁的 IP："
+  printf '%s\n' "$list" | sed 's/^/  /'
+  echo
+  ask "输入要解封的 IP（输入 all 解封全部，直接回车取消）" "" || return 0
+  case "$REPLY" in
+    "") return 0 ;;
+    all|ALL) confirm "确定解封全部 IP？" n && do_unban --all ;;
+    *) do_unban "$REPLY" ;;
+  esac
+}
+
+menu_ban() {
+  need_running || return 1
+  ask "输入要封禁的 IP（直接回车取消）" "" || return 0
+  [ -z "$REPLY" ] && return 0
+  do_ban "$REPLY"
+}
+
+# ---------------------------------------------------------------- 白名单
+
+menu_whitelist() {
+  need_managed || return 1
+  local items i n myip target
+  while true; do
+    load_config
+    read -ra items <<<"$CFG_IGNOREIP"
+    myip=$(detect_client_ip)
+    echo
+    echo "${BOLD}== 白名单（ignoreip）==${NC}"
+    i=1
+    for n in "${items[@]}"; do
+      printf '  %2d) %s\n' "$i" "$n"
+      i=$((i + 1))
+    done
+    echo
+    echo "  a) 添加 IP / 网段"
+    echo "  d) 删除"
+    [ -n "$myip" ] && echo "  m) 添加当前登录 IP ($myip)"
+    echo "  0) 返回"
+    ask "请选择" "" || return 0
+    case "$REPLY" in
+      a|A)
+        ask "输入 IP 或网段（如 1.2.3.4 或 1.2.3.0/24）" "" || continue
+        target=$REPLY
+        [ -z "$target" ] && continue
+        if ! is_ip_or_cidr "$target"; then err "格式不对: $target"; continue; fi
+        if in_ignoreip "$target"; then info "$target 已在白名单里。"; continue; fi
+        CFG_IGNOREIP="$CFG_IGNOREIP $target"
+        apply_config && fail2ban-client unban "$target" >/dev/null 2>&1
+        ;;
+      m|M)
+        [ -z "$myip" ] && continue
+        if in_ignoreip "$myip"; then info "$myip 已在白名单里。"; continue; fi
+        CFG_IGNOREIP="$CFG_IGNOREIP $myip"
+        apply_config && fail2ban-client unban "$myip" >/dev/null 2>&1
+        ;;
+      d|D)
+        ask "输入要删除的序号" "" || continue
+        if ! [[ $REPLY =~ ^[0-9]+$ ]] || [ "$REPLY" -lt 1 ] || [ "$REPLY" -gt "${#items[@]}" ]; then
+          err "序号无效。"
+          continue
+        fi
+        unset "items[$((REPLY - 1))]"
+        CFG_IGNOREIP="${items[*]:-}"
+        apply_config
+        ;;
+      0|"") return 0 ;;
+      *) warn "无效选项。" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- 修改参数
+
+menu_params() {
+  need_managed || return 1
+  load_config
+  local dirty=0 ver
+  ver=$(f2b_version)
+  while true; do
+    echo
+    echo "${BOLD}== 修改参数 ==${NC}"
+    printf '  1) bantime          首次封禁时长       %s\n' "$CFG_BANTIME"
+    printf '  2) findtime         统计时间窗口       %s\n' "$CFG_FINDTIME"
+    printf '  3) maxretry         窗口内允许失败次数 %s\n' "$CFG_MAXRETRY"
+    printf '  4) bantime.increment 递增封禁          %s\n' "$CFG_INCREMENT"
+    printf '  5) bantime.factor   递增系数           %s\n' "$CFG_FACTOR"
+    printf '  6) bantime.maxtime  封禁时长上限       %s\n' "$CFG_MAXTIME"
+    printf '  7) mode             sshd 过滤模式      %s\n' "$CFG_MODE"
+    echo
+    printf '  封禁阶梯预览: %s\n' "$(show_ladder)"
+    echo
+    if [ "$dirty" = 1 ]; then
+      echo "  s) 保存并应用    q) 放弃修改并返回"
+    else
+      echo "  0) 返回"
+    fi
+    ask "请选择" "" || return 0
+    case "$REPLY" in
+      1)
+        ask "bantime（如 1h / 1d / 1w，-1 为永久）" "$CFG_BANTIME" || continue
+        if [ "$REPLY" = "-1" ] || valid_time "$REPLY"; then CFG_BANTIME=$REPLY; dirty=1
+        else err "格式不对。"; fi
+        ;;
+      2)
+        ask "findtime（如 10m / 15m / 1h）" "$CFG_FINDTIME" || continue
+        if valid_time "$REPLY"; then CFG_FINDTIME=$REPLY; dirty=1; else err "格式不对。"; fi
+        ;;
+      3)
+        ask "maxretry（正整数）" "$CFG_MAXRETRY" || continue
+        if [[ $REPLY =~ ^[1-9][0-9]*$ ]]; then CFG_MAXRETRY=$REPLY; dirty=1; else err "需要正整数。"; fi
+        ;;
+      4)
+        if ! ver_ge "${ver:-0.0}" 0.11; then
+          err "fail2ban ${ver:-?} 低于 0.11，不支持递增封禁。"
+          continue
+        fi
+        if [ "$CFG_INCREMENT" = true ]; then CFG_INCREMENT=false; else CFG_INCREMENT=true; fi
+        dirty=1
+        ;;
+      5)
+        echo "  说明：默认公式本身每次翻倍，factor 是额外乘数。"
+        echo "        factor=1 → 1 倍、2 倍、4 倍、8 倍...；factor=2 → 1 倍、4 倍、8 倍、16 倍..."
+        ask "bantime.factor（正数）" "$CFG_FACTOR" || continue
+        if [[ $REPLY =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v f="$REPLY" 'BEGIN { exit !(f > 0) }'; then
+          CFG_FACTOR=$REPLY; dirty=1
+        else err "需要大于 0 的数字。"; fi
+        ;;
+      6)
+        ask "bantime.maxtime（如 1w / 4w）" "$CFG_MAXTIME" || continue
+        if valid_time "$REPLY"; then CFG_MAXTIME=$REPLY; dirty=1; else err "格式不对。"; fi
+        ;;
+      7)
+        echo "  normal     只匹配明确的认证失败（默认）"
+        echo "  ddos       额外匹配预认证阶段的异常断开 / 扫描"
+        echo "  extra      额外匹配算法协商失败等少见情况"
+        echo "  aggressive 以上全部（抓得最多，误伤风险略高）"
+        ask "mode" "$CFG_MODE" || continue
+        case "$REPLY" in
+          normal|ddos|extra|aggressive) CFG_MODE=$REPLY; dirty=1 ;;
+          *) err "只能是 normal / ddos / extra / aggressive。" ;;
+        esac
+        ;;
+      s|S)
+        [ "$dirty" = 1 ] || continue
+        apply_config && dirty=0
+        return 0
+        ;;
+      q|Q) info "已放弃修改。"; return 0 ;;
+      0|"")
+        if [ "$dirty" = 1 ]; then
+          if confirm "有未保存的修改，保存并应用？" y; then apply_config; fi
+        fi
+        return 0
+        ;;
+      *) warn "无效选项。" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- SSH 端口重新识别
+
+menu_port() {
+  need_managed || return 1
+  load_config
+  local detected
+  detected=$(detect_ssh_ports)
+  echo "  配置中的端口: $CFG_PORT"
+  echo "  检测到的端口: ${detected:-（未检测到）}"
+  ask "要写入的端口（多个用逗号分隔）" "${detected:-$CFG_PORT}" || return 0
+  if ! valid_ports "$REPLY"; then
+    err "端口格式不对，例如: 22 或 22,2222"
+    return 1
+  fi
+  if [ "$REPLY" = "$CFG_PORT" ]; then
+    ok "端口没有变化，无需修改。"
+    return 0
+  fi
+  CFG_PORT=$REPLY
+  apply_config
+}
+
+# ---------------------------------------------------------------- 日志
+
+log_recent_bans() {
+  if [ -s "$F2B_LOG" ]; then
+    grep -E '\] (Ban|Unban|Restore Ban|Increase Ban) ' "$F2B_LOG" | tail -n 30
+  else
+    journalctl -u fail2ban --no-pager -n 500 2>/dev/null |
+      grep -E '\] (Ban|Unban|Restore Ban|Increase Ban) ' | tail -n 30
+  fi
+}
+
+log_follow() {
+  info "实时日志，按 Ctrl+C 返回菜单。"
+  trap ':' INT
+  if [ -f "$F2B_LOG" ]; then
+    tail -n 20 -f "$F2B_LOG"
+  else
+    journalctl -u fail2ban -n 20 -f
+  fi
+  trap - INT
+  echo
+}
+
+ssh_fail_top() {
+  local src="" f
+  if command -v journalctl >/dev/null 2>&1; then
+    src=$(journalctl _COMM=sshd _COMM=sshd-session --since "24 hours ago" --no-pager -o cat 2>/dev/null)
+  fi
+  if [ -z "$src" ]; then
+    for f in /var/log/auth.log /var/log/secure; do
+      [ -r "$f" ] && src=$(tail -n 50000 "$f" | grep -E 'sshd(-session)?\[')
+      [ -n "$src" ] && break
+    done
+  fi
+  printf '%s\n' "$src" |
+    grep -E 'Failed password|Invalid user|authentication failure|maximum authentication attempts|Connection closed by (authenticating|invalid) user' |
+    grep -oE '(from |rhost=)[0-9a-fA-F:.]+' |
+    sed -E 's/^(from |rhost=)//' |
+    sort | uniq -c | sort -rn | head -n 10
+}
+
+menu_logs() {
+  local out
+  while true; do
+    echo
+    echo "${BOLD}== 日志 ==${NC}"
+    echo "  1) 最近的封禁 / 解封记录"
+    echo "  2) 实时跟踪 fail2ban 日志"
+    echo "  3) 最近 24 小时 SSH 失败登录来源 Top 10"
+    echo "  0) 返回"
+    ask "请选择" "" || return 0
+    case "$REPLY" in
+      1)
+        out=$(log_recent_bans)
+        if [ -n "$out" ]; then printf '%s\n' "$out"; else info "还没有封禁记录。"; fi
+        ;;
+      2) log_follow ;;
+      3)
+        out=$(ssh_fail_top)
+        if [ -n "$out" ]; then
+          echo "  失败日志条数  来源 IP"
+          printf '%s\n' "$out"
+        else
+          info "最近 24 小时没有 SSH 失败登录记录。"
+        fi
+        ;;
+      0|"") return 0 ;;
+      *) warn "无效选项。" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- 服务管理 / 卸载
+
+menu_service() {
+  need_f2b || return 1
+  while true; do
+    echo
+    echo "${BOLD}== 服务管理 ==${NC}  当前: $(svc_state)  开机自启: $(systemctl is-enabled fail2ban 2>/dev/null || echo 未知)"
+    echo "  1) 启动    2) 停止    3) 重启"
+    echo "  4) 开启开机自启    5) 关闭开机自启"
+    echo "  0) 返回"
+    ask "请选择" "" || return 0
+    case "$REPLY" in
+      1) systemctl start fail2ban && ok "已启动。" ;;
+      2) systemctl stop fail2ban && ok "已停止（停止期间所有封禁规则会被撤掉，启动后恢复）。" ;;
+      3) systemctl restart fail2ban && ok "已重启。" ;;
+      4) systemctl enable fail2ban >/dev/null 2>&1 && ok "已开启开机自启。" ;;
+      5) systemctl disable fail2ban >/dev/null 2>&1 && ok "已关闭开机自启。" ;;
+      0|"") return 0 ;;
+      *) warn "无效选项。" ;;
+    esac
+  done
+}
+
+do_uninstall() {
+  require_root
+  detect_os
+  echo "${BOLD}== 卸载 ==${NC}"
+  echo "  将停止 fail2ban、关闭开机自启，并移除本脚本生成的配置。"
+  if [ "$ASSUME_YES" != 1 ]; then
+    confirm "确定继续？" n || { info "已取消。"; return 0; }
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now fail2ban >/dev/null 2>&1 && ok "已停止 fail2ban 并关闭开机自启。"
+  fi
+
+  local latest=""
+  if is_managed; then
+    rm -f "$JAIL_LOCAL" "$JAIL_LOCAL.prev"
+    ok "已删除 $JAIL_LOCAL"
+    latest=$(ls -1t "$JAIL_LOCAL".bak.* 2>/dev/null | head -n1)
+    if [ -n "$latest" ]; then
+      cp -p "$latest" "$JAIL_LOCAL" && ok "已恢复部署前的配置: $latest"
+    fi
+  elif [ -f "$JAIL_LOCAL" ]; then
+    warn "$JAIL_LOCAL 不是本脚本生成的，保持不动。"
+  fi
+  if [ -f "$F2B_LOCAL" ] && grep -qF "$MARKER" "$F2B_LOCAL"; then
+    rm -f "$F2B_LOCAL"
+    ok "已删除 $F2B_LOCAL"
+  fi
+
+  if command -v fail2ban-client >/dev/null 2>&1 && [ "$ASSUME_YES" != 1 ]; then
+    if confirm "同时卸载 fail2ban 软件包？（nftables 等依赖保留）" n; then
+      case "$PKG" in
+        apt) DEBIAN_FRONTEND=noninteractive apt-get purge -y fail2ban ;;
+        dnf|yum) "$PKG" remove -y 'fail2ban*' ;;
+        *) warn "未知的包管理器，请手动卸载。" ;;
+      esac
+    fi
+  fi
+  ok "卸载流程结束。"
+}
+
+# ---------------------------------------------------------------- 主菜单
+
+menu_header() {
+  local state="${YELLOW}未安装${NC}" extra=""
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    state=$(svc_state)
+    if fail2ban-client ping >/dev/null 2>&1; then
+      extra="  当前封禁: $(banned_count || true) 个"
+    fi
+  fi
+  echo
+  echo "${BOLD}=========== fail2ban 管理脚本 v${SCRIPT_VERSION} ===========${NC}"
+  echo "  状态: ${state}${extra}"
+  echo "-----------------------------------------------"
+  echo "   1) 一键部署（安装 + 配置 + 启动）"
+  echo "   2) 查看状态 / 封禁列表"
+  echo "   3) 解封 IP"
+  echo "   4) 手动封禁 IP"
+  echo "   5) 白名单管理"
+  echo "   6) 修改参数"
+  echo "   7) 重新识别 SSH 端口"
+  echo "   8) 日志"
+  echo "   9) 服务管理"
+  echo "  10) 卸载"
+  echo "   0) 退出"
+  echo "-----------------------------------------------"
+}
+
+menu() {
+  if [ -z "$INPUT" ]; then
+    err "没有可用的交互终端。请直接使用子命令，例如: bash $0 install -y"
+    exit 1
+  fi
+  while true; do
+    menu_header
+    ask "请选择 [0-10]" "" || exit 0
+    case "$REPLY" in
+      1)  do_install;     pause ;;
+      2)  do_status;      pause ;;
+      3)  menu_unban;     pause ;;
+      4)  menu_ban;       pause ;;
+      5)  menu_whitelist ;;
+      6)  menu_params ;;
+      7)  menu_port;      pause ;;
+      8)  menu_logs ;;
+      9)  menu_service ;;
+      10) do_uninstall;   pause ;;
+      0|q|Q) exit 0 ;;
+      "") ;;
+      *)  warn "无效选项: $REPLY" ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF
+fail2ban 一键部署 / 管理脚本 v${SCRIPT_VERSION}
+
+用法:
+  bash $0                    进入交互菜单
+  bash $0 install [-y]       一键部署（-y: 不提问，全部使用默认值）
+  bash $0 status             查看状态和封禁列表
+  bash $0 unban <IP>|--all   解封
+  bash $0 ban <IP>           手动封禁
+  bash $0 ports              显示检测到的 SSH 端口
+  bash $0 uninstall [-y]     卸载
+EOF
+}
+
+main() {
+  local args=() a
+  for a in "$@"; do
+    case "$a" in
+      -y|--yes) ASSUME_YES=1 ;;
+      -h|--help) usage; exit 0 ;;
+      -V|--version) echo "$SCRIPT_VERSION"; exit 0 ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  init_input
+  reset_defaults
+
+  local cmd=${args[0]:-}
+  case "$cmd" in
+    "")        require_root; menu ;;
+    install)   do_install ;;
+    status)    require_root; do_status ;;
+    unban)     require_root; do_unban "${args[1]:-}" ;;
+    ban)       require_root; do_ban "${args[1]:-}" ;;
+    ports)     detect_ssh_ports ;;
+    uninstall) do_uninstall ;;
+    *) err "未知命令: $cmd"; usage; exit 1 ;;
+  esac
+}
+
+# 被 source 时不执行（方便测试）；直接运行或 curl | bash 时执行
+if [ -z "${BASH_SOURCE[0]:-}" ] || [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

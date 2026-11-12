@@ -14,10 +14,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Syntax check
-        run: bash -n fail2ban.sh && bash -n tests/run.sh
+        run: |
+          bash -n fail2ban.sh
+          bash -n tests/run.sh
+          bash -n tests/f2b_parse.sh
 
       - name: ShellCheck
-        run: shellcheck --severity=warning fail2ban.sh tests/run.sh
+        run: shellcheck --severity=warning fail2ban.sh tests/run.sh tests/f2b_parse.sh
 
       - name: Function tests
         run: bash tests/run.sh
+
+      - name: Install fail2ban
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends fail2ban
+
+      - name: Config precedence with the real fail2ban
+        run: bash tests/f2b_parse.sh

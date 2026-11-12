@@ -3,6 +3,9 @@
 # fail2ban 一键部署 / 管理脚本（保护 SSH）
 # https://github.com/mozziexwz/fail2ban_script
 #
+# 兼容 MSBOOST：MSBOOST 部署节点时配置的 fail2ban 可以直接查看、解封；
+# 改白名单或参数时由本脚本接管，MSBOOST 的白名单原样保留。
+#
 # 用法:
 #   bash fail2ban.sh                 交互菜单
 #   bash fail2ban.sh install [-y]    一键部署（-y 全部使用默认值，不提问）
@@ -14,7 +17,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.1.0"
 F2B_DIR="${F2B_DIR:-/etc/fail2ban}"
 JAIL_LOCAL="$F2B_DIR/jail.local"
 F2B_LOCAL="$F2B_DIR/fail2ban.local"
@@ -22,6 +25,11 @@ F2B_LOG="${F2B_LOG:-/var/log/fail2ban.log}"
 # 生成的配置文件只写 ASCII，避免 fail2ban 在 C locale 下读配置出编码问题
 MARKER="# Managed by fail2ban.sh (fail2ban_script)"
 JAIL="sshd"
+# MSBOOST（网站 v2.12.0+、本地版 v1.2.0+）部署和升级节点时写的配置。本脚本只读，不改不删。
+# MSBOOST 看到任何 *.local 就不再改动 fail2ban，所以本脚本写了 jail.local 之后它的文件就固定不变了。
+MSB_JAIL="$F2B_DIR/jail.d/zz-msboost.conf"
+MSB_MARKER="# Managed by MSBOOST"
+MSB_NODE_STATE="${MSB_NODE_STATE:-/etc/msboost/install.env}"
 ASSUME_YES=0
 INPUT=""
 PKG=""
@@ -136,11 +144,47 @@ need_running() {
 
 is_managed() { [ -f "$JAIL_LOCAL" ] && grep -qF "$MARKER" "$JAIL_LOCAL"; }
 
+# MSBOOST 写的 jail.d/zz-msboost.conf，第一行是它的标记
+has_msboost() {
+  local first=""
+  [ -f "$MSB_JAIL" ] && [ ! -L "$MSB_JAIL" ] || return 1
+  IFS= read -r first <"$MSB_JAIL" || true
+  [[ $first == "$MSB_MARKER"* ]]
+}
+
+# 装过 MSBOOST 节点的服务器
+is_msboost_node() { [ -f "$MSB_NODE_STATE" ]; }
+
+# sshd jail 现在按谁的配置运行：script / msboost / foreign / none
+config_source() {
+  if is_managed; then echo script
+  elif [ -e "$JAIL_LOCAL" ]; then echo foreign
+  elif has_msboost; then echo msboost
+  else echo none
+  fi
+}
+
+config_source_label() {
+  case "$(config_source)" in
+    script)
+      if has_msboost; then printf '本脚本（%s，已接管 MSBOOST 的配置）' "$JAIL_LOCAL"
+      else printf '本脚本（%s）' "$JAIL_LOCAL"; fi ;;
+    msboost) printf 'MSBOOST（%s）' "$MSB_JAIL" ;;
+    foreign) printf '%s（不是本脚本生成的）' "$JAIL_LOCAL" ;;
+    *)       printf '发行版默认配置' ;;
+  esac
+}
+
+# 修改白名单 / 参数 / 端口之前调用；MSBOOST 管理的服务器先询问是否接管
 need_managed() {
-  if ! is_managed; then
-    err "没有找到本脚本生成的 $JAIL_LOCAL，请先执行菜单 1（一键部署）。"
+  is_managed && return 0
+  if [ "$(config_source)" = msboost ]; then
+    msboost_takeover_notice
+    confirm "现在由本脚本接管？" y && takeover_msboost && return 0
     return 1
   fi
+  err "没有找到本脚本生成的 $JAIL_LOCAL，请先执行菜单 1（一键部署）。"
+  return 1
 }
 
 detect_os() {
@@ -308,46 +352,136 @@ ini_get() {
     }' "$1" 2>/dev/null
 }
 
+# ini_has 文件 段名 键名   这个键是否写在该段里（值可以为空）
+ini_has() {
+  awk -v sec="$2" -v key="$3" '
+    /^[[:space:]]*\[/ {
+      cur = $0
+      sub(/^[[:space:]]*\[/, "", cur); sub(/\].*$/, "", cur)
+      next
+    }
+    /^[[:space:]]*[#;]/ { next }
+    cur == sec {
+      i = index($0, "=")
+      if (!i) next
+      k = substr($0, 1, i - 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (k == key) { found = 1; exit }
+    }
+    END { exit !found }' "$1" 2>/dev/null
+}
+
+# v1.0 写的 jail.local：白名单和封禁参数在 [DEFAULT]，在 MSBOOST 的服务器上会被它的 [sshd] 盖住
+is_v10_layout() { is_managed && ! ini_has "$JAIL_LOCAL" "$JAIL" ignoreip; }
+
+# _ld 变量 文件 键   先找 [sshd]，再找 [DEFAULT]（v1.0 把大部分参数写在 [DEFAULT] 里）
 _ld() {
   local v
-  v=$(ini_get "$JAIL_LOCAL" "$2" "$3")
+  v=$(ini_get "$2" "$JAIL" "$3")
+  [ -n "$v" ] || v=$(ini_get "$2" DEFAULT "$3")
   [ -n "$v" ] && printf -v "$1" '%s' "$v"
+  return 0
+}
+
+# read_config 文件 -> CFG_*
+read_config() {
+  local f=$1
+  reset_defaults
+  CFG_INCREMENT="false"
+  CFG_IGNOREIP=""        # 白名单被清空时文件里是空值，不能回落到默认值
+  _ld CFG_IGNOREIP      "$f" ignoreip
+  _ld CFG_BANACTION     "$f" banaction
+  _ld CFG_BANACTION_ALL "$f" banaction_allports
+  _ld CFG_BANTIME       "$f" bantime
+  _ld CFG_FINDTIME      "$f" findtime
+  _ld CFG_MAXRETRY      "$f" maxretry
+  _ld CFG_INCREMENT     "$f" bantime.increment
+  _ld CFG_FACTOR        "$f" bantime.factor
+  _ld CFG_MAXTIME       "$f" bantime.maxtime
+  _ld CFG_MODE          "$f" mode
+  _ld CFG_BACKEND       "$f" backend
+  _ld CFG_PORT          "$f" port
+  CFG_IGNOREIP=$(trim "${CFG_IGNOREIP//,/ }")
   return 0
 }
 
 load_config() {
   reset_defaults
   is_managed || return 1
-  CFG_INCREMENT="false"
-  CFG_IGNOREIP=""        # 白名单被清空时文件里是空值，不能回落到默认值
-  _ld CFG_IGNOREIP      DEFAULT ignoreip
-  _ld CFG_BANACTION     DEFAULT banaction
-  _ld CFG_BANACTION_ALL DEFAULT banaction_allports
-  _ld CFG_BANTIME       DEFAULT bantime
-  _ld CFG_FINDTIME      DEFAULT findtime
-  _ld CFG_MAXRETRY      DEFAULT maxretry
-  _ld CFG_INCREMENT     DEFAULT bantime.increment
-  _ld CFG_FACTOR        DEFAULT bantime.factor
-  _ld CFG_MAXTIME       DEFAULT bantime.maxtime
-  _ld CFG_MODE          "$JAIL" mode
-  _ld CFG_BACKEND       "$JAIL" backend
-  _ld CFG_PORT          "$JAIL" port
-  CFG_IGNOREIP=$(trim "${CFG_IGNOREIP//,/ }")
+  read_config "$JAIL_LOCAL"
+  # v1.0 的文件压在 MSBOOST 上面时，实际生效的是 MSBOOST 的白名单。
+  # 改写成新格式之前先把它并进来，执行机不会因为升级本脚本而掉出白名单。
+  if is_v10_layout && has_msboost; then
+    merge_ignoreip "$(msboost_ignoreip)"
+  fi
   return 0
 }
 
+# 读 MSBOOST 的 jail.d/zz-msboost.conf（设置都在 [sshd] 里）
+load_msboost_config() {
+  reset_defaults
+  has_msboost || return 1
+  read_config "$MSB_JAIL"
+  CFG_IGNOREIP=$(msboost_ignoreip)
+  valid_ports "$CFG_PORT" || CFG_PORT=$(detect_ssh_ports)
+  [ -n "$CFG_PORT" ] || CFG_PORT=22
+  return 0
+}
+
+# MSBOOST 白名单里格式正确的条目：回环地址、网站执行机的 IP、部署节点时的来源地址
+msboost_ignoreip() {
+  local v x out="" arr=()
+  has_msboost || return 0
+  v=$(ini_get "$MSB_JAIL" "$JAIL" ignoreip)
+  read -ra arr <<<"${v//,/ }"
+  for x in ${arr[@]+"${arr[@]}"}; do
+    is_ip_or_cidr "$x" && out+="${out:+ }$x"
+  done
+  printf '%s' "$out"
+}
+
+# in_list 条目 "空格分隔的列表"   精确匹配
+in_list() {
+  local x arr=()
+  read -ra arr <<<"${2//,/ }"
+  for x in ${arr[@]+"${arr[@]}"}; do
+    [ "$x" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# 把列表里还不在 CFG_IGNOREIP 中的条目追加进去
+merge_ignoreip() {
+  local x arr=()
+  read -ra arr <<<"${1//,/ }"
+  for x in ${arr[@]+"${arr[@]}"}; do
+    in_list "$x" "$CFG_IGNOREIP" || CFG_IGNOREIP="${CFG_IGNOREIP:+$CFG_IGNOREIP }$x"
+  done
+}
+
+# SSH 的设置全部写在 [sshd]：jail.d/*.conf 先于 jail.local 读取，但其中 [sshd] 段的值
+# 比 jail.local 的 [DEFAULT] 优先。MSBOOST 的 zz-msboost.conf 就把设置写在 [sshd] 里，
+# 所以只有写在 [sshd] 里才能盖过它。[DEFAULT] 只留封禁动作，供以后添加的其他 jail 使用。
 render_config() {
   cat <<EOF
 $MARKER
 # Generated: $(date '+%F %T')
 # Change settings through the script menu; manual edits are overwritten
 # the next time the script rewrites this file.
+# The SSH settings are all in [$JAIL]: only there do they also win over
+# [$JAIL] values in jail.d/*.conf, such as MSBOOST's zz-msboost.conf.
 
 [DEFAULT]
-ignoreip = $CFG_IGNOREIP
 banaction = $CFG_BANACTION
 banaction_allports = $CFG_BANACTION_ALL
 
+[$JAIL]
+enabled = true
+mode = $CFG_MODE
+backend = $CFG_BACKEND
+port = $CFG_PORT
+banaction = $CFG_BANACTION
+ignoreip = $CFG_IGNOREIP
 bantime = $CFG_BANTIME
 findtime = $CFG_FINDTIME
 maxretry = $CFG_MAXRETRY
@@ -358,15 +492,10 @@ bantime.increment = true
 bantime.factor = $CFG_FACTOR
 bantime.maxtime = $CFG_MAXTIME
 EOF
+  else
+    # 显式写 false：MSBOOST 的文件里可能是 true
+    echo "bantime.increment = false"
   fi
-  cat <<EOF
-
-[$JAIL]
-enabled = true
-mode = $CFG_MODE
-backend = $CFG_BACKEND
-port = $CFG_PORT
-EOF
 }
 
 # 封禁历史默认只保留 1 天左右，递增封禁需要更长的记忆。
@@ -583,13 +712,36 @@ detect_client_ip() {
   fi
 }
 
-in_ignoreip() {
-  local x
-  for x in ${CFG_IGNOREIP//,/ }; do
-    [ "$x" = "$1" ] && return 0
+ip4_to_int() {
+  local IFS=. a b c d
+  read -r a b c d <<<"$1"
+  echo $(( (a << 24) | (b << 16) | (c << 8) | d ))
+}
+
+# ip4_in_cidr IP 网段   IPv4 网段是否包含这个 IP
+ip4_in_cidr() {
+  local net=${2%/*} bits=${2#*/} mask
+  [[ $2 == */* ]] && is_ipv4 "$1" && is_ipv4 "$net" || return 1
+  [[ $bits =~ ^(0|[1-9][0-9]?)$ ]] && (( bits <= 32 )) || return 1
+  mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+  (( ($(ip4_to_int "$1") & mask) == ($(ip4_to_int "$net") & mask) ))
+}
+
+# ignoreip_cover IP -> 打印白名单里覆盖它的条目：相同的地址，或包含它的 IPv4 网段
+# （MSBOOST 本地版把电脑所在的 /16 放进白名单）
+ignoreip_cover() {
+  local x arr=()
+  read -ra arr <<<"${CFG_IGNOREIP//,/ }"
+  for x in ${arr[@]+"${arr[@]}"}; do
+    if [ "$x" = "$1" ] || ip4_in_cidr "$1" "$x"; then
+      printf '%s' "$x"
+      return 0
+    fi
   done
   return 1
 }
+
+in_ignoreip() { ignoreip_cover "$1" >/dev/null; }
 
 # ---------------------------------------------------------------- 安装
 
@@ -683,31 +835,74 @@ choose_backend() {
   fi
 }
 
+# ---------------------------------------------------------------- MSBOOST
+
+msboost_takeover_notice() {
+  info "这台服务器的 fail2ban 是 MSBOOST 配置的（$MSB_JAIL）。由本脚本接管后："
+  echo "  - MSBOOST 的白名单（网站执行机的 IP、部署节点时的来源地址）和参数原样带过来，写进 $JAIL_LOCAL；"
+  echo "  - MSBOOST 的文件不改不删，只是其中的设置被 $JAIL_LOCAL 覆盖；"
+  echo "  - 之后 MSBOOST「升级节点」会显示「已有 fail2ban 配置，未改动」，不再更新白名单。"
+  echo "    网站新增或更换执行机后，要在菜单 5 把新执行机的 IP 加进白名单；"
+  echo "  - 想交还给 MSBOOST：菜单 10 卸载，只删除本脚本的配置，fail2ban 改回按 MSBOOST 的配置运行。"
+}
+
+# 菜单 5/6/7 里接管：把 MSBOOST 的参数、白名单、端口原样转成本脚本的 jail.local
+takeover_msboost() {
+  need_f2b || return 1
+  load_msboost_config || return 1
+  choose_banaction
+  choose_backend
+  write_f2b_local
+  apply_config restart || return 1
+  ok "已由本脚本接管，MSBOOST 的文件保持原样。"
+}
+
+# ---------------------------------------------------------------- 一键部署
+
 do_install() {
   require_root
   require_systemd || return 1
   detect_os
   echo "${BOLD}== 一键部署 fail2ban ==${NC}"
 
-  install_pkgs || return 1
+  local ver detected myip cover bak src keep=0
 
-  local ver detected myip bak keep=0
+  # 已有配置的处理（先问清楚再装软件包，取消时不留改动）
+  reset_defaults
+  src=$(config_source)
+  case "$src" in
+    script)
+      if confirm "检测到本脚本之前生成的配置，保留现有参数和白名单？（选 n 恢复默认值）" y; then
+        load_config
+        keep=1
+      fi
+      ;;
+    foreign)
+      bak="$JAIL_LOCAL.bak.$(date +%Y%m%d-%H%M%S)"
+      warn "已存在 $JAIL_LOCAL（不是本脚本生成的），将备份后覆盖。"
+      confirm "继续？" y || { info "已取消。"; return 1; }
+      cp -p "$JAIL_LOCAL" "$bak" && ok "已备份到 $bak"
+      ;;
+    msboost)
+      msboost_takeover_notice
+      confirm "继续部署（由本脚本接管）？" y || { info "已取消。"; return 1; }
+      load_msboost_config
+      keep=1
+      ;;
+  esac
+  # 恢复默认值时也带上 MSBOOST 的白名单，网站执行机不能因此被封
+  if [ "$keep" != 1 ] && has_msboost; then
+    merge_ignoreip "$(msboost_ignoreip)"
+    info "已带上 MSBOOST 的白名单: $CFG_IGNOREIP"
+  fi
+  if [ "$src" != script ] && is_msboost_node && ! has_msboost; then
+    warn "这是 MSBOOST 节点，但 MSBOOST 没有配置它的 fail2ban。由本脚本配置后，MSBOOST 以后也不会改动 fail2ban，"
+    warn "网站执行机不会自动加入白名单；用网站管理这台服务器的话，可以在菜单 5 添加执行机的 IP。"
+  fi
+
+  install_pkgs || return 1
   ver=$(f2b_version)
   info "fail2ban 版本: ${ver:-未知}"
-
-  # 已有配置的处理
-  reset_defaults
-  if is_managed; then
-    if confirm "检测到本脚本之前生成的配置，保留现有参数和白名单？（选 n 恢复默认值）" y; then
-      load_config
-      keep=1
-    fi
-  elif [ -f "$JAIL_LOCAL" ]; then
-    bak="$JAIL_LOCAL.bak.$(date +%Y%m%d-%H%M%S)"
-    warn "已存在 $JAIL_LOCAL（不是本脚本生成的），将备份后覆盖。"
-    confirm "继续？" y || { info "已取消。"; return 1; }
-    cp -p "$JAIL_LOCAL" "$bak" && ok "已备份到 $bak"
-  fi
 
   choose_banaction
   choose_backend
@@ -736,10 +931,14 @@ do_install() {
 
   # 当前登录 IP
   myip=$(detect_client_ip)
-  if [ -n "$myip" ] && ! in_ignoreip "$myip"; then
-    info "你当前的登录 IP 是 $myip"
-    if confirm "把它加入白名单（永不封禁）？固定 IP 建议加，动态 IP 不建议" n; then
-      CFG_IGNOREIP="$CFG_IGNOREIP $myip"
+  if [ -n "$myip" ]; then
+    if cover=$(ignoreip_cover "$myip"); then
+      [ "$cover" = "$myip" ] || info "你当前的登录 IP $myip 在白名单网段 $cover 里。"
+    else
+      info "你当前的登录 IP 是 $myip"
+      if confirm "把它加入白名单（永不封禁）？固定 IP 建议加，动态 IP 不建议" n; then
+        CFG_IGNOREIP="${CFG_IGNOREIP:+$CFG_IGNOREIP }$myip"
+      fi
     fi
   fi
 
@@ -749,6 +948,9 @@ do_install() {
   echo
   echo "${BOLD}部署完成，当前配置：${NC}"
   print_config_summary
+  if has_msboost; then
+    info "MSBOOST 的 $MSB_JAIL 保持原样，其中的设置已被 $JAIL_LOCAL 覆盖。"
+  fi
   echo
   fail2ban-client status "$JAIL" 2>/dev/null | sed 's/^/  /'
   if [ -n "$myip" ] && ! in_ignoreip "$myip"; then
@@ -793,11 +995,24 @@ do_status() {
   printf '  版本:       %s\n' "$(f2b_version)"
   printf '  服务:       %s\n' "$(svc_state)"
   printf '  开机自启:   %s\n' "$(enabled_state)"
-  if load_config; then
-    print_config_summary
-  else
-    warn "当前 jail.local 不是本脚本生成的，下面只显示运行状态。"
-  fi
+  printf '  配置来源:   %s\n' "$(config_source_label)"
+  case "$(config_source)" in
+    script)
+      load_config
+      print_config_summary
+      if is_v10_layout && has_msboost; then
+        warn "jail.local 还是 v1.0 的格式，白名单和封禁参数被 MSBOOST 的 $MSB_JAIL 盖住了，实际按 MSBOOST 的生效。"
+        warn "执行一次菜单 1（保留现有参数），或在菜单 5/6 保存一次，就会改成新格式并生效（上面的白名单已合并 MSBOOST 的条目）。"
+      fi
+      ;;
+    msboost)
+      load_msboost_config
+      print_config_summary
+      info "解封、封禁、日志可以直接用；改白名单、参数或端口时（菜单 5/6/7），本脚本会先询问是否接管。"
+      ;;
+    foreign) warn "当前 jail.local 不是本脚本生成的，下面只显示运行状态。" ;;
+    *)       warn "没有本脚本或 MSBOOST 的配置，下面只显示运行状态。" ;;
+  esac
   echo
   if ! fail2ban-client ping >/dev/null 2>&1; then
     warn "fail2ban 服务未运行。"
@@ -886,28 +1101,50 @@ menu_ban() {
 
 # ---------------------------------------------------------------- 白名单
 
+# 已在白名单里（本身或所在网段）时提示并返回 0
+already_whitelisted() {
+  local cover
+  cover=$(ignoreip_cover "$1") || return 1
+  if [ "$cover" = "$1" ]; then
+    info "$1 已在白名单里。"
+  else
+    info "$1 已在白名单网段 $cover 里。"
+  fi
+}
+
+# 白名单里由 MSBOOST 写入的条目（不含回环地址）
+is_msboost_entry() {
+  ! is_loopback_entry "$1" && in_list "$1" "$2"
+}
+
 menu_whitelist() {
   need_managed || return 1
-  local items i n myip target
+  local items i n myip target msb tag
   while true; do
     load_config
     read -ra items <<<"$CFG_IGNOREIP"
     myip=$(detect_client_ip)
+    msb=$(msboost_ignoreip)
     echo
     echo "${BOLD}== 白名单（ignoreip）==${NC}"
     i=1
     if [ "${#items[@]}" -gt 0 ]; then
       for n in "${items[@]}"; do
-        printf '  %2d) %s\n' "$i" "$n"
+        tag=""
+        is_msboost_entry "$n" "$msb" && tag="  （MSBOOST）"
+        printf '  %2d) %s%s\n' "$i" "$n" "$tag"
         i=$((i + 1))
       done
     else
       echo "  （空）"
     fi
+    if [ -n "$msb" ]; then
+      echo "  标着 MSBOOST 的条目是 MSBOOST 写入的：网站执行机的 IP，或部署节点时的来源地址。"
+    fi
     echo
     echo "  a) 添加 IP / 网段"
     echo "  d) 删除"
-    [ -n "$myip" ] && echo "  m) 添加当前登录 IP ($myip)"
+    [ -n "$myip" ] && ! in_ignoreip "$myip" && echo "  m) 添加当前登录 IP ($myip)"
     echo "  0) 返回"
     ask "请选择" "" || return 0
     case "$REPLY" in
@@ -916,14 +1153,14 @@ menu_whitelist() {
         target=$REPLY
         [ -z "$target" ] && continue
         if ! is_ip_or_cidr "$target"; then err "格式不对: $target"; continue; fi
-        if in_ignoreip "$target"; then info "$target 已在白名单里。"; continue; fi
-        CFG_IGNOREIP="$CFG_IGNOREIP $target"
+        already_whitelisted "$target" && continue
+        CFG_IGNOREIP="${CFG_IGNOREIP:+$CFG_IGNOREIP }$target"
         apply_config && fail2ban-client unban "$target" >/dev/null 2>&1
         ;;
       m|M)
         [ -z "$myip" ] && continue
-        if in_ignoreip "$myip"; then info "$myip 已在白名单里。"; continue; fi
-        CFG_IGNOREIP="$CFG_IGNOREIP $myip"
+        already_whitelisted "$myip" && continue
+        CFG_IGNOREIP="${CFG_IGNOREIP:+$CFG_IGNOREIP }$myip"
         apply_config && fail2ban-client unban "$myip" >/dev/null 2>&1
         ;;
       d|D)
@@ -935,6 +1172,10 @@ menu_whitelist() {
         target=${items[$((REPLY - 1))]}
         if is_loopback_entry "$target"; then
           warn "$target 是本机回环地址，一般应保留在白名单里。"
+          confirm "确定删除？" n || continue
+        elif is_msboost_entry "$target" "$msb"; then
+          warn "$target 是 MSBOOST 写入的（网站执行机的 IP，或部署节点时的来源地址）。"
+          warn "删掉后，从这里连接时输错几次密码就会被封，MSBOOST 的任务也就连不上这台服务器了。"
           confirm "确定删除？" n || continue
         fi
         unset "items[$((REPLY - 1))]"
@@ -1172,17 +1413,29 @@ menu_service() {
 do_uninstall() {
   require_root
   detect_os
+  local msb=0 mine=0 latest=""
+  has_msboost && msb=1
+  if is_managed || { [ -f "$F2B_LOCAL" ] && grep -qF "$MARKER" "$F2B_LOCAL"; }; then mine=1; fi
   echo "${BOLD}== 卸载 ==${NC}"
-  echo "  将停止 fail2ban、关闭开机自启，并移除本脚本生成的配置。"
+  if [ "$msb" = 1 ]; then
+    if [ "$mine" != 1 ]; then
+      info "这台服务器的 fail2ban 由 MSBOOST 管理，没有本脚本生成的配置，不需要卸载。"
+      echo "  要彻底去掉 fail2ban，请自行卸载软件包；MSBOOST 下次升级节点时会重新安装。"
+      return 0
+    fi
+    echo "  将移除本脚本生成的配置。这台服务器还有 MSBOOST 的 fail2ban 配置（$MSB_JAIL），"
+    echo "  移除后 fail2ban 不停，改回按 MSBOOST 的配置保护 SSH，软件包保留。"
+  else
+    echo "  将停止 fail2ban、关闭开机自启，并移除本脚本生成的配置。"
+  fi
   if [ "$ASSUME_YES" != 1 ]; then
     confirm "确定继续？" n || { info "已取消。"; return 0; }
   fi
 
-  if command -v systemctl >/dev/null 2>&1; then
+  if [ "$msb" != 1 ] && command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now fail2ban >/dev/null 2>&1 && ok "已停止 fail2ban 并关闭开机自启。"
   fi
 
-  local latest=""
   if is_managed; then
     rm -f "$JAIL_LOCAL" "$JAIL_LOCAL.prev"
     ok "已删除 $JAIL_LOCAL"
@@ -1198,6 +1451,27 @@ do_uninstall() {
     ok "已删除 $F2B_LOCAL"
   fi
 
+  # 交还给 MSBOOST：服务不停，重启后按 MSBOOST 的配置运行
+  if [ "$msb" = 1 ]; then
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+      if systemctl restart fail2ban 2>/dev/null && wait_jail; then
+        ok "fail2ban 已改回按 MSBOOST 的配置运行。"
+      else
+        err "fail2ban 没能按 MSBOOST 的配置启动，请查看: journalctl -u fail2ban"
+        show_failure_logs
+      fi
+    else
+      info "fail2ban 当前没有运行，下次启动时按 MSBOOST 的配置。"
+    fi
+    if [ -e "$JAIL_LOCAL" ]; then
+      info "$JAIL_LOCAL 是部署前就有的配置，MSBOOST 仍会把这台服务器当作已有配置，不会更新白名单。"
+    else
+      info "在 MSBOOST 网站或本地版上「升级节点」一次，MSBOOST 会按当前执行机刷新白名单。"
+    fi
+    ok "卸载流程结束。"
+    return 0
+  fi
+
   if command -v fail2ban-client >/dev/null 2>&1 && [ "$ASSUME_YES" != 1 ]; then
     if confirm "同时卸载 fail2ban 软件包？（nftables 等依赖保留）" n; then
       case "$PKG" in
@@ -1207,22 +1481,35 @@ do_uninstall() {
       esac
     fi
   fi
+  if is_msboost_node && [ ! -e "$JAIL_LOCAL" ]; then
+    info "这是 MSBOOST 节点：在 MSBOOST 网站或本地版上「升级节点」一次，MSBOOST 会重新配置 fail2ban。"
+  fi
   ok "卸载流程结束。"
 }
 
 # ---------------------------------------------------------------- 主菜单
 
 menu_header() {
-  local state="${YELLOW}未安装${NC}" extra=""
+  local state="${YELLOW}未安装${NC}" extra="" src
   if command -v fail2ban-client >/dev/null 2>&1; then
     state=$(svc_state)
     if fail2ban-client ping >/dev/null 2>&1; then
       extra="  当前封禁: $(banned_count || true) 个"
     fi
   fi
+  case "$(config_source)" in
+    script)
+      src="本脚本"
+      has_msboost && src="本脚本（已接管 MSBOOST）"
+      ;;
+    msboost) src="MSBOOST" ;;
+    foreign) src="其他（jail.local 不是本脚本生成的）" ;;
+    *)       src="未配置" ;;
+  esac
   echo
   echo "${BOLD}=========== fail2ban 管理脚本 v${SCRIPT_VERSION} ===========${NC}"
   echo "  状态: ${state}${extra}"
+  echo "  配置: ${src}"
   echo "-----------------------------------------------"
   echo "   1) 一键部署（安装 + 配置 + 启动）"
   echo "   2) 查看状态 / 封禁列表"
